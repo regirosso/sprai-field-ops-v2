@@ -1,0 +1,1 @@
+if('serviceWorker' in navigator) {window.addEventListener('load', () => {navigator.serviceWorker.register('/sprai-field-ops-v2/sw.js', { scope: '/sprai-field-ops-v2/' })})}
