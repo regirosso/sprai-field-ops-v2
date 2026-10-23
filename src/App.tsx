@@ -50,6 +50,26 @@ interface ExtendedAppState extends AppState {
   farosExtraConfig?: 'SI' | 'NO' | null;
 }
 
+// Quita fotos y firma (lo que mas pesa) para guardar en el historial del celular.
+// El historial solo muestra cliente / numero / fecha, asi que no las necesita.
+const stripHeavy = (st: AppState): AppState => ({
+  ...st,
+  signature: undefined,
+  sections: (st.sections || []).map(sec => ({
+    ...sec,
+    items: (sec.items || []).map(it => ({ ...it, photos: [] })),
+  })),
+});
+
+const slimHistory = (items: HistoryItem[]): HistoryItem[] =>
+  (Array.isArray(items) ? items : []).map(h => (h.data ? { ...h, data: stripHeavy(h.data) } : h)).slice(0, 50);
+
+interface UploadFailure {
+  message: string;
+  pdf?: { save: (filename: string) => unknown } | null;
+  filename?: string;
+}
+
 export default function App() {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [pinInput, setPinInput] = useState('');
@@ -87,6 +107,7 @@ export default function App() {
   const [pendingDraft, setPendingDraft] = useState<ExtendedAppState | null>(null);
   const [showDraftModal, setShowDraftModal] = useState(false);
   const [isFinished, setIsFinished] = useState(false); 
+  const [uploadError, setUploadError] = useState<UploadFailure | null>(null);
 
   // Al arrancar, revisamos si hay un borrador pendiente
   useEffect(() => {
@@ -105,9 +126,15 @@ export default function App() {
   const [history, setHistory] = useState<HistoryItem[]>(() => {
     try {
       const saved = localStorage.getItem(HISTORY_KEY);
-      return saved ? JSON.parse(saved) : [];
+      return saved ? slimHistory(JSON.parse(saved)) : [];
     } catch { return []; }
   });
+
+  // Libera espacio: reescribe el historial ya sin las fotos que versiones anteriores guardaban
+  useEffect(() => {
+    try { localStorage.setItem(HISTORY_KEY, JSON.stringify(history)); } catch (e) { console.error(e); }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const [currentGroupId, setCurrentGroupId] = useState('mod'); 
   const [isGenerating, setIsGenerating] = useState(false);
@@ -115,7 +142,13 @@ export default function App() {
   // Auto-guardado condicional
   useEffect(() => {
     if (!isFinished && (state.clientName || state.sprAiNumber)) {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+      } catch (e) {
+        // Sin espacio en el celular: guardamos al menos los textos (sin fotos ni firma)
+        console.error(e);
+        try { localStorage.setItem(STORAGE_KEY, JSON.stringify(stripHeavy(state))); } catch (e2) { console.error(e2); }
+      }
     }
   }, [state, isFinished]);
 
@@ -256,35 +289,39 @@ export default function App() {
       };
 
       const result: FinalizeResult = await finalizeReport(finalStateToExport, metricsForExcel);
-      
-      if (result && result.filename) {
-        const newHistoryItem: HistoryItem = {
-          id: crypto.randomUUID(),
-          date: new Date().toLocaleDateString(),
-          clientName: state.clientName || 'Cliente',
-          sprAiNumber: state.sprAiNumber || 'S/N',
+
+      if (!result.uploaded) {
+        // No se pudo enviar: NO se borra nada. El instalador puede reintentar o bajar el PDF.
+        setUploadError({
+          message: result.error || 'No se pudo enviar el reporte.',
+          pdf: result.pdf,
           filename: result.filename,
-          timestamp: Date.now(),
-          data: state
-        };
-        const updatedHistory = [newHistoryItem, ...history];
-        setHistory(updatedHistory);
-        localStorage.setItem(HISTORY_KEY, JSON.stringify(updatedHistory));
-
-        setIsFinished(true); 
-        setShowSuccessToast(true);
-
-        setTimeout(() => {
-          localStorage.removeItem(STORAGE_KEY); 
-          window.location.reload();             
-        }, 2000);
+        });
+        return;
       }
+
+      const newHistoryItem: HistoryItem = {
+        id: crypto.randomUUID(),
+        date: new Date().toLocaleDateString(),
+        clientName: state.clientName || 'Cliente',
+        sprAiNumber: state.sprAiNumber || 'S/N',
+        filename: result.filename,
+        timestamp: Date.now(),
+        data: stripHeavy(state)
+      };
+      const updatedHistory = [newHistoryItem, ...history].slice(0, 50);
+      setHistory(updatedHistory);
+      try { localStorage.setItem(HISTORY_KEY, JSON.stringify(updatedHistory)); } catch (e) { console.error(e); }
+      try { localStorage.removeItem(STORAGE_KEY); } catch (e) { console.error(e); }
+
+      setIsFinished(true);
+      setShowSuccessToast(true);
     } catch (error) {
       console.error(error);
-      alert("Reporte procesado. Verifique su carpeta de descargas.");
-      setIsFinished(true);
-      localStorage.removeItem(STORAGE_KEY);
-      setTimeout(() => window.location.reload(), 1500);
+      setUploadError({
+        message: 'No se pudo generar el reporte en este celular. Probá de nuevo.',
+        pdf: null,
+      });
     } finally {
       setIsGenerating(false);
     }
@@ -842,9 +879,15 @@ export default function App() {
                 <div className="bg-brand-green-dark p-2 rounded-full text-brand-gold"><UserCheck size={22} /></div>
                 <div>
                   <p className="text-brand-green-dark font-black text-sm uppercase leading-none">¡REPORTE GENERADO!</p>
-                  <p className="text-brand-green-dark/70 text-[10px] font-bold mt-1">Descarga completada con éxito.</p>
+                  <p className="text-brand-green-dark/70 text-[10px] font-bold mt-1">Enviado a Google Drive correctamente.</p>
                 </div>
               </div>
+              <button
+                onClick={() => window.location.reload()}
+                className="w-full py-3 bg-brand-green-dark text-brand-gold rounded-2xl font-black text-xs uppercase tracking-wider active:scale-95 transition-all"
+              >
+                Empezar nuevo checklist
+              </button>
             </div>
           </motion.div>
         )}
@@ -873,6 +916,51 @@ export default function App() {
               </div>
             </div>
           </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* CARTEL: NO SE PUDO ENVIAR (no se borra nada) */}
+      <AnimatePresence>
+        {uploadError && (
+          <div className="fixed inset-0 z-[400] flex items-center justify-center p-4 bg-black/80 backdrop-blur-md">
+            <motion.div
+              initial={{ scale: 0.9, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.9, opacity: 0 }}
+              className="bg-brand-green border-2 border-red-400/40 p-6 rounded-3xl max-w-md w-full text-center shadow-2xl space-y-5"
+            >
+              <div className="bg-red-500/10 p-3 rounded-full inline-block text-red-400">
+                <AlertCircle size={32} />
+              </div>
+              <div className="space-y-2">
+                <h3 className="text-red-400 font-black text-lg uppercase tracking-tight">No se pudo enviar</h3>
+                <p className="text-slate-300 text-xs leading-relaxed">{uploadError.message}</p>
+                <p className="text-white text-xs font-bold">Tu checklist sigue guardado en este celular. No se borró nada.</p>
+              </div>
+              <div className="flex flex-col gap-2 pt-1">
+                <button
+                  onClick={() => { setUploadError(null); handleFinalize(); }}
+                  className="w-full py-3.5 bg-brand-gold text-brand-green-dark rounded-2xl font-black text-xs uppercase tracking-wider active:scale-95 transition-all shadow-lg"
+                >
+                  Reintentar envío
+                </button>
+                {uploadError.pdf && (
+                  <button
+                    onClick={() => uploadError.pdf?.save(uploadError.filename || 'Reporte.pdf')}
+                    className="w-full py-3 bg-white/10 text-white rounded-2xl font-bold text-xs uppercase tracking-wider active:scale-95 transition-all border border-white/20"
+                  >
+                    Descargar PDF
+                  </button>
+                )}
+                <button
+                  onClick={() => setUploadError(null)}
+                  className="w-full py-3 bg-black/40 text-slate-300 rounded-2xl font-bold text-xs uppercase tracking-wider active:scale-95 transition-all"
+                >
+                  Cerrar
+                </button>
+              </div>
+            </motion.div>
+          </div>
         )}
       </AnimatePresence>
 

@@ -26,23 +26,17 @@ function addNewPage(pdf: jsPDF): number {
   return 20;
 }
 
-function showToast(message: string) {
-  const toast = document.createElement('div');
-  toast.innerHTML = `
-    <div style="position: fixed; bottom: 20px; right: 20px; background: #1b7340; color: white; padding: 16px 24px; border-radius: 12px; box-shadow: 0 10px 15px -3px rgba(0,0,0,0.1); z-index: 9999; font-family: sans-serif; max-width: 300px; border-left: 5px solid #f2b705; animation: slideIn 0.3s ease-out;">
-      <p style="margin: 0; font-weight: bold; font-size: 14px;">✅ Reporte Finalizado</p>
-      <p style="margin: 4px 0 0; font-size: 12px; opacity: 0.9;">${message}</p>
-    </div>
-    <style>
-      @keyframes slideIn { from { transform: translateY(100%); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
-    </style>
-  `;
-  document.body.appendChild(toast);
-  setTimeout(() => { 
-    toast.style.opacity = '0'; 
-    toast.style.transition = '0.5s'; 
-    setTimeout(() => toast.remove(), 500); 
-  }, 6000);
+export interface FinalizeResult {
+  uploaded: boolean;   // true solo si Google confirmó que recibió el reporte
+  filename: string;
+  error?: string;      // mensaje para mostrar al instalador si uploaded = false
+  pdf: jsPDF;          // se devuelve para poder ofrecer "Descargar PDF" si falla el envío
+}
+
+// iPhone / iPad (incluye iPadOS que se presenta como Mac)
+function isIOS(): boolean {
+  const ua = navigator.userAgent || '';
+  return /iPad|iPhone|iPod/.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 }
 
 export async function buildPDF(data: AppState): Promise<jsPDF> {
@@ -184,11 +178,9 @@ export async function buildPDF(data: AppState): Promise<jsPDF> {
   return pdf;
 }
 
-export async function finalizeReport(data: AppState, metrics: any) {
+export async function finalizeReport(data: AppState, metrics: any): Promise<FinalizeResult> {
   const pdf = await buildPDF(data);
   const filename = `Reporte_${data.sprAiNumber || 'SN'}.pdf`;
-  
-  pdf.save(filename);
 
   const base64 = pdf.output('datauristring').split(',')[1];
   
@@ -228,10 +220,14 @@ export async function finalizeReport(data: AppState, metrics: any) {
   if (data.farosExtraConfig === 'SI') farosExtraStatus = "Sí, Instalados";
   else if (data.farosExtraConfig === 'NO') farosExtraStatus = "No Lleva";
 
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 120000); // 2 min maximo
+
   try {
     const response = await fetch(APPS_SCRIPT_URL, {
       method: 'POST',
-      headers: { 'Content-Type': 'text/plain' }, 
+      headers: { 'Content-Type': 'text/plain' },
+      signal: controller.signal,
       body: JSON.stringify({ 
         filename, 
         base64, 
@@ -256,17 +252,28 @@ export async function finalizeReport(data: AppState, metrics: any) {
       }),
     });
 
-    const resData = await response.json();
-    if (resData.success) {
-      showToast("Reporte guardado en Google Drive y Sheet con éxito.");
-    } else {
-      showToast("Descargado. Error al subir: " + resData.error);
+    if (!response.ok) {
+      throw new Error(`El servidor respondió con error (${response.status}).`);
     }
-    
-  } catch (err) {
+    const resData = await response.json();
+    if (!resData.success) {
+      throw new Error(resData.error || 'Google rechazó el envío.');
+    }
+  } catch (err: any) {
     console.error("Error en la sincronización:", err);
-    showToast("Reporte descargado localmente. Error al sincronizar con Google.");
+    let msg: string;
+    if (err?.name === 'AbortError') msg = 'El envío tardó demasiado. Revisá tu conexión e intentá de nuevo.';
+    else if (err instanceof TypeError) msg = 'No se pudo conectar con Google Drive. Revisá tu conexión a internet e intentá de nuevo.';
+    else msg = err?.message || 'No se pudo enviar el reporte a Google Drive.';
+    return { uploaded: false, filename, error: msg, pdf };
+  } finally {
+    clearTimeout(timeoutId);
   }
 
-  return { success: true, filename };
+  // Descarga local solo DESPUES de enviar, y no en iPhone (ahi iOS manda la app a segundo plano).
+  if (!isIOS()) {
+    try { pdf.save(filename); } catch (e) { console.error(e); }
+  }
+
+  return { uploaded: true, filename, pdf };
 }
