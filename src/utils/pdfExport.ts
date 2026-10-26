@@ -178,6 +178,42 @@ export async function buildPDF(data: AppState): Promise<jsPDF> {
   return pdf;
 }
 
+// Google respondio explicitamente que el envio fallo (distinto de no recibir respuesta).
+class ScriptRejected extends Error {}
+
+// Hash simple (cyrb53): mismo contenido => mismo ID. Asi un reintento del MISMO checklist
+// no se duplica en Drive, y si el instalador cambia algo, se manda como reporte nuevo.
+function hashString(str: string): string {
+  let h1 = 0xdeadbeef, h2 = 0x41c6ce57;
+  for (let i = 0; i < str.length; i++) {
+    const ch = str.charCodeAt(i);
+    h1 = Math.imul(h1 ^ ch, 2654435761);
+    h2 = Math.imul(h2 ^ ch, 1597334677);
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36);
+}
+
+// Le pregunta a Google si ya recibio el reporte (por si la respuesta original se perdio).
+// Espera hasta ~60 s porque el script puede seguir procesando fotos y mail.
+async function confirmarRecepcion(reportId: string): Promise<boolean> {
+  let respuestasInvalidas = 0;
+  for (let i = 0; i < 12; i++) {
+    await new Promise(r => setTimeout(r, 5000));
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) return false;
+    try {
+      const res = await fetch(`${APPS_SCRIPT_URL}?accion=estado&id=${encodeURIComponent(reportId)}`);
+      const j = await res.json();
+      if (j && j.received === true) return true;
+    } catch (e) {
+      // SyntaxError = el script no entiende la consulta (version vieja): no tiene sentido seguir
+      if (e instanceof SyntaxError && ++respuestasInvalidas >= 2) return false;
+    }
+  }
+  return false;
+}
+
 export async function finalizeReport(data: AppState, metrics: any): Promise<FinalizeResult> {
   const pdf = await buildPDF(data);
   const filename = `Reporte_${data.sprAiNumber || 'SN'}.pdf`;
@@ -220,15 +256,18 @@ export async function finalizeReport(data: AppState, metrics: any): Promise<Fina
   if (data.farosExtraConfig === 'SI') farosExtraStatus = "Sí, Instalados";
   else if (data.farosExtraConfig === 'NO') farosExtraStatus = "No Lleva";
 
+  const reportId = `${data.sprAiNumber || 'SN'}-${hashString(JSON.stringify(data))}`;
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 120000); // 2 min maximo
 
+  let failure: string | null = null;
   try {
     const response = await fetch(APPS_SCRIPT_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'text/plain' },
       signal: controller.signal,
       body: JSON.stringify({ 
+        reportId,
         filename, 
         base64, 
         mimeType: 'application/pdf',
@@ -257,17 +296,29 @@ export async function finalizeReport(data: AppState, metrics: any): Promise<Fina
     }
     const resData = await response.json();
     if (!resData.success) {
-      throw new Error(resData.error || 'Google rechazó el envío.');
+      throw new ScriptRejected(resData.error || 'Google rechazó el envío.');
     }
   } catch (err: any) {
     console.error("Error en la sincronización:", err);
-    let msg: string;
-    if (err?.name === 'AbortError') msg = 'El envío tardó demasiado. Revisá tu conexión e intentá de nuevo.';
-    else if (err instanceof TypeError) msg = 'No se pudo conectar con Google Drive. Revisá tu conexión a internet e intentá de nuevo.';
-    else msg = err?.message || 'No se pudo enviar el reporte a Google Drive.';
-    return { uploaded: false, filename, error: msg, pdf };
+    if (err instanceof ScriptRejected) {
+      // Google respondio explicitamente que fallo: no hay nada que confirmar
+      failure = err.message;
+    } else {
+      // Resultado incierto (corte de red, timeout, respuesta perdida): puede haber llegado igual.
+      // Le preguntamos a Google antes de dar el envio por fallido.
+      const llego = await confirmarRecepcion(reportId);
+      if (!llego) {
+        if (err?.name === 'AbortError') failure = 'El envío tardó demasiado. Revisá tu conexión e intentá de nuevo.';
+        else if (err instanceof TypeError) failure = 'No se pudo conectar con Google Drive. Revisá tu conexión a internet e intentá de nuevo.';
+        else failure = err?.message || 'No se pudo enviar el reporte a Google Drive.';
+      }
+    }
   } finally {
     clearTimeout(timeoutId);
+  }
+
+  if (failure) {
+    return { uploaded: false, filename, error: failure, pdf };
   }
 
   // Descarga local solo DESPUES de enviar, y no en iPhone (ahi iOS manda la app a segundo plano).
